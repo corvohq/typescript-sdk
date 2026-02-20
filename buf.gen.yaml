@@ -1,0 +1,10 @@
+version: v2
+plugins:
+  - local: protoc-gen-es
+    out: packages/worker/src/gen
+    opt: target=ts
+  - local: protoc-gen-es
+    out: packages/client/src/gen
+    opt: target=ts
+inputs:
+  - directory: proto
