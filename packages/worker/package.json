@@ -11,7 +11,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@corvohq/client": "0.1.0",
+    "@corvohq/client": "0.2.0",
     "@connectrpc/connect": "^2.1.1",
     "@connectrpc/connect-node": "^2.1.1",
     "@bufbuild/protobuf": "^2.11.0"
