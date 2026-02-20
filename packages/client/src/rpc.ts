@@ -11,8 +11,13 @@ import {
 // Auth interceptor
 // ---------------------------------------------------------------------------
 
+const SDK_NAME = "corvo-typescript";
+const SDK_VERSION = "0.2.0";
+
 function authInterceptor(auth: AuthOptions): Interceptor {
   return (next) => async (req) => {
+    req.header.set("x-corvo-client-name", SDK_NAME);
+    req.header.set("x-corvo-client-version", SDK_VERSION);
     if (auth.headers) {
       for (const [k, v] of Object.entries(auth.headers)) {
         req.header.set(k, v);

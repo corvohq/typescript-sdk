@@ -15,6 +15,12 @@ npm install @corvohq/client
 npm install @corvohq/worker
 ```
 
+## Compatibility
+
+| SDK Version | Corvo Server |
+|-------------|-------------|
+| 0.2.x       | >= 0.2.0    |
+
 ## Quick Start
 
 ### Client
