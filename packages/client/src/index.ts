@@ -1,3 +1,8 @@
+export type ServerInfo = {
+  server_version: string;
+  api_version: string;
+};
+
 export type EnqueueResult = {
   job_id: string;
   status: string;
@@ -298,6 +303,10 @@ export class CorvoClient {
 
   async deleteJob(id: string): Promise<void> {
     await this.request(`/api/v1/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+  }
+
+  async getServerInfo(): Promise<ServerInfo> {
+    return this.request("/api/v1/info", { method: "GET" });
   }
 
   async bulkGetJobs<T = Record<string, unknown>>(ids: string[]): Promise<T[]> {
