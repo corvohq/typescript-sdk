@@ -116,6 +116,19 @@ export type EnqueueOptions = {
   chain?: ChainConfig;
 };
 
+export type CorvoEvent = {
+  type: string;
+  id: string;
+  data: Record<string, unknown>;
+};
+
+export type SubscribeOptions = {
+  queues?: string[];
+  job_ids?: string[];
+  types?: string[];
+  last_event_id?: number;
+};
+
 export type AuthOptions = {
   headers?: Record<string, string>;
   bearerToken?: string;
@@ -285,6 +298,76 @@ export class CorvoClient {
 
   async deleteJob(id: string): Promise<void> {
     await this.request(`/api/v1/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+  }
+
+  async bulkGetJobs<T = Record<string, unknown>>(ids: string[]): Promise<T[]> {
+    const result = await this.request<{ jobs: T[] }>("/api/v1/jobs/bulk-get", {
+      method: "POST",
+      body: JSON.stringify({ job_ids: ids }),
+    });
+    return result.jobs;
+  }
+
+  async *subscribe(options: SubscribeOptions = {}): AsyncGenerator<CorvoEvent> {
+    const params = new URLSearchParams();
+    if (options.queues?.length) params.set("queues", options.queues.join(","));
+    if (options.job_ids?.length) params.set("job_ids", options.job_ids.join(","));
+    if (options.types?.length) params.set("types", options.types.join(","));
+    if (options.last_event_id !== undefined) params.set("last_event_id", String(options.last_event_id));
+
+    const qs = params.toString();
+    const url = `${this.baseURL}/api/v1/events${qs ? "?" + qs : ""}`;
+    const authHeaders = await this.authHeaders();
+
+    const res = await this.fetchImpl(url, {
+      headers: { ...authHeaders },
+    });
+
+    if (!res.ok) throw new Error(`SSE stream failed: HTTP ${res.status}`);
+    if (!res.body) throw new Error("SSE stream: no response body");
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        let eventType = "";
+        let eventId = "";
+        let dataLines: string[] = [];
+
+        for (const line of lines) {
+          if (line.startsWith("event: ")) {
+            eventType = line.slice(7);
+          } else if (line.startsWith("id: ")) {
+            eventId = line.slice(4);
+          } else if (line.startsWith("data: ")) {
+            dataLines.push(line.slice(6));
+          } else if (line === "") {
+            if (dataLines.length > 0) {
+              try {
+                const data = JSON.parse(dataLines.join("\n"));
+                yield { type: eventType, id: eventId, data };
+              } catch {
+                // skip malformed events
+              }
+            }
+            eventType = "";
+            eventId = "";
+            dataLines = [];
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
   }
 
   private async request<T>(path: string, init: RequestInit): Promise<T> {
