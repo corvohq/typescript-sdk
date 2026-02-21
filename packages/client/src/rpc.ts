@@ -12,7 +12,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SDK_NAME = "corvo-typescript";
-const SDK_VERSION = "0.2.0";
+const SDK_VERSION = "0.3.0";
 
 function authInterceptor(auth: AuthOptions): Interceptor {
   return (next) => async (req) => {

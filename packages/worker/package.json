@@ -1,17 +1,19 @@
 {
   "name": "@corvohq/worker",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TypeScript worker runtime for Corvo",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@corvohq/client": "0.2.0",
+    "@corvohq/client": "0.3.0",
     "@connectrpc/connect": "^2.1.1",
     "@connectrpc/connect-node": "^2.1.1",
     "@bufbuild/protobuf": "^2.11.0"

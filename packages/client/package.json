@@ -1,12 +1,14 @@
 {
   "name": "@corvohq/client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TypeScript client for Corvo",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json"
   },
