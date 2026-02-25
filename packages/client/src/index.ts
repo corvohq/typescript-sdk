@@ -119,6 +119,7 @@ export type EnqueueOptions = {
   retry_base_delay?: string;
   retry_max_delay?: string;
   chain?: ChainConfig;
+  batch_id?: string;
 };
 
 export type CorvoEvent = {
@@ -303,6 +304,21 @@ export class CorvoClient {
 
   async deleteJob(id: string): Promise<void> {
     await this.request(`/api/v1/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+  }
+
+  async createBatch(callbackQueue: string, callbackPayload?: unknown): Promise<{ batch_id: string }> {
+    const body: Record<string, unknown> = { callback_queue: callbackQueue };
+    if (callbackPayload !== undefined) body.callback_payload = callbackPayload;
+    return this.request("/api/v1/batch", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  async sealBatch(batchID: string): Promise<{ status: string }> {
+    return this.request(`/api/v1/batch/${encodeURIComponent(batchID)}/seal`, {
+      method: "POST",
+    });
   }
 
   async getServerInfo(): Promise<ServerInfo> {
