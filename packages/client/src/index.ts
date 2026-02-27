@@ -16,6 +16,8 @@ export type SearchFilter = {
   tags?: Record<string, string>;
   payload_contains?: string;
   payload_jq?: string;
+  chain_id?: string;
+  batch_id?: string;
   sort?: string;
   order?: "asc" | "desc";
   limit?: number;
