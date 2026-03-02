@@ -145,8 +145,14 @@ export type AuthOptions = {
   tokenProvider?: () => Promise<string> | string;
 };
 
+export type RetryOptions = {
+  maxAttempts?: number; // default 3; 0 disables retry
+  baseDelay?: number;   // default 1000ms; jittered ±25%
+};
+
 export type ClientOptions = {
   useRpc?: boolean;
+  retry?: RetryOptions;
 };
 
 export class PayloadTooLargeError extends Error {
@@ -165,6 +171,8 @@ export class CorvoClient {
   readonly fetchImpl: typeof fetch;
   readonly auth: AuthOptions;
   private readonly useRpc: boolean;
+  private readonly retryMaxAttempts: number;
+  private readonly retryBaseDelay: number;
   private rpcClient: import("./rpc.js").ClientRpc | null = null;
 
   constructor(baseURL: string, fetchImpl: typeof fetch = fetch, auth: AuthOptions = {}, opts: ClientOptions = {}) {
@@ -172,6 +180,8 @@ export class CorvoClient {
     this.fetchImpl = fetchImpl;
     this.auth = auth;
     this.useRpc = opts.useRpc ?? false;
+    this.retryMaxAttempts = opts.retry?.maxAttempts ?? 3;
+    this.retryBaseDelay = opts.retry?.baseDelay ?? 1000;
   }
 
   private async getRpc(): Promise<import("./rpc.js").ClientRpc> {
@@ -399,33 +409,58 @@ export class CorvoClient {
 
   private async request<T>(path: string, init: RequestInit): Promise<T> {
     const authHeaders = await this.authHeaders();
-    const res = await this.fetchImpl(this.baseURL + path, {
-      ...init,
-      headers: {
-        "content-type": "application/json",
-        ...authHeaders,
-        ...(init.headers || {}),
-      },
-    });
+    const attempts = this.retryMaxAttempts > 0 ? this.retryMaxAttempts : 1;
+    let lastError: Error | undefined;
 
-    if (!res.ok) {
-      let details = `HTTP ${res.status}`;
-      let code = "";
-      try {
-        const body = (await res.json()) as { error?: string; code?: string };
-        if (body.error) details = body.error;
-        if (body.code) code = body.code;
-      } catch {
-        // ignore decode errors for non-JSON responses
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) {
+        const jitter = 0.75 + Math.random() * 0.5; // 0.75x–1.25x
+        await new Promise((r) => setTimeout(r, this.retryBaseDelay * jitter));
       }
-      if (code === "PAYLOAD_TOO_LARGE") throw new PayloadTooLargeError(details);
-      throw new Error(details);
-    }
 
-    if (res.status === 204) {
-      return {} as T;
+      let res: Response;
+      try {
+        res = await this.fetchImpl(this.baseURL + path, {
+          ...init,
+          headers: {
+            "content-type": "application/json",
+            ...authHeaders,
+            ...(init.headers || {}),
+          },
+        });
+      } catch (err) {
+        // Network error (connection refused, etc.)
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (attempt < attempts - 1) continue;
+        throw lastError;
+      }
+
+      if (res.status === 502 || res.status === 503 || res.status === 429) {
+        lastError = new Error(`HTTP ${res.status}`);
+        if (attempt < attempts - 1) continue;
+        throw lastError;
+      }
+
+      if (!res.ok) {
+        let details = `HTTP ${res.status}`;
+        let code = "";
+        try {
+          const body = (await res.json()) as { error?: string; code?: string };
+          if (body.error) details = body.error;
+          if (body.code) code = body.code;
+        } catch {
+          // ignore decode errors for non-JSON responses
+        }
+        if (code === "PAYLOAD_TOO_LARGE") throw new PayloadTooLargeError(details);
+        throw new Error(details);
+      }
+
+      if (res.status === 204) {
+        return {} as T;
+      }
+      return (await res.json()) as T;
     }
-    return (await res.json()) as T;
+    throw lastError ?? new Error("request failed");
   }
 
   async authHeaders(): Promise<Record<string, string>> {
