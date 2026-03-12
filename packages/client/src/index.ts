@@ -4,9 +4,10 @@ export type ServerInfo = {
 };
 
 export type EnqueueResult = {
+  job: Record<string, unknown> | null;
   job_id: string;
-  status: string;
-  unique_existing?: boolean;
+  unique_existing: boolean;
+  unique_job_id: string;
 };
 
 export type SearchFilter = {
@@ -88,12 +89,33 @@ export type FetchedJob = {
   queue: string;
   payload: unknown;
   attempt: number;
+  max_retries?: number;
+  lease_duration?: number;
+  checkpoint?: unknown;
+  tags?: Record<string, string>;
+  agent?: Record<string, unknown>;
+};
+
+export type HeartbeatJobStatus = {
+  status: string;
+  budget_exceeded?: boolean;
 };
 
 export type HeartbeatResult = {
-  acked: string[];
-  unknown: string[];
-  canceled: string[];
+  jobs: Record<string, HeartbeatJobStatus>;
+  lease_expires_at?: string;
+};
+
+export type FailResult = {
+  job: Record<string, unknown> | null;
+  status: string;
+  next_attempt_at?: string;
+  attempts_remaining: number;
+  err_doc?: Record<string, unknown>;
+};
+
+export type SealBatchResult = {
+  callback_job?: Record<string, unknown>;
 };
 
 export type ChainStep = {
@@ -197,17 +219,21 @@ export class CorvoClient {
       const rpc = await this.getRpc();
       return rpc.enqueue(queue, payload);
     }
-    return this.request("/api/v1/enqueue", {
+    const result = await this.request<any>("/api/v1/enqueue", {
       method: "POST",
       body: JSON.stringify({ queue, payload, ...extra }),
     });
+    result.job_id = result.job?.id ?? result.unique_job_id ?? '';
+    return result as EnqueueResult;
   }
 
   async enqueueWith(opts: EnqueueOptions): Promise<EnqueueResult> {
-    return this.request("/api/v1/enqueue", {
+    const result = await this.request<any>("/api/v1/enqueue", {
       method: "POST",
       body: JSON.stringify(opts),
     });
+    result.job_id = result.job?.id ?? result.unique_job_id ?? '';
+    return result as EnqueueResult;
   }
 
   async getJob<T = Record<string, unknown>>(id: string): Promise<T> {
@@ -275,7 +301,7 @@ export class CorvoClient {
     });
   }
 
-  async fail(jobID: string, error: string, backtrace?: string): Promise<{ status: string }> {
+  async fail(jobID: string, error: string, backtrace?: string): Promise<FailResult> {
     if (this.useRpc) {
       const rpc = await this.getRpc();
       return rpc.fail(jobID, error, backtrace ?? "");
@@ -289,9 +315,7 @@ export class CorvoClient {
   async heartbeat(jobs: Record<string, Record<string, unknown>>): Promise<HeartbeatResult> {
     if (this.useRpc) {
       const rpc = await this.getRpc();
-      // HeartbeatResult shape from HTTP differs from proto; adapt here
-      const resp = await rpc.heartbeat(jobs);
-      return resp as unknown as HeartbeatResult;
+      return rpc.heartbeat(jobs);
     }
     return this.request("/api/v1/heartbeat", {
       method: "POST",
@@ -327,7 +351,7 @@ export class CorvoClient {
     });
   }
 
-  async sealBatch(batchID: string): Promise<{ status: string }> {
+  async sealBatch(batchID: string): Promise<SealBatchResult> {
     return this.request(`/api/v1/batch/${encodeURIComponent(batchID)}/seal`, {
       method: "POST",
     });

@@ -59,13 +59,14 @@ export class ClientRpc {
   async enqueue(
     queue: string,
     payload: unknown,
-  ): Promise<{ job_id: string; status: string; unique_existing?: boolean }> {
+  ): Promise<import("./index.js").EnqueueResult> {
     const payloadJson = JSON.stringify(payload ?? {});
     const resp = await this.client.enqueue({ queue, payloadJson });
     return {
+      job: null,
       job_id: resp.jobId,
-      status: resp.status,
-      unique_existing: resp.uniqueExisting || undefined,
+      unique_existing: resp.uniqueExisting,
+      unique_job_id: resp.uniqueExisting ? resp.jobId : '',
     };
   }
 
@@ -73,14 +74,18 @@ export class ClientRpc {
     jobId: string,
     error: string,
     backtrace = "",
-  ): Promise<{ status: string }> {
+  ): Promise<import("./index.js").FailResult> {
     const resp = await this.client.fail({ jobId, error, backtrace });
-    return { status: resp.status };
+    return {
+      job: null,
+      status: resp.status,
+      attempts_remaining: 0,
+    };
   }
 
   async heartbeat(
     jobs: Record<string, Record<string, unknown>>,
-  ): Promise<{ jobs: Record<string, { status: string }> }> {
+  ): Promise<import("./index.js").HeartbeatResult> {
     const protoJobs: Record<string, import("./gen/corvo/v1/worker_pb.js").HeartbeatJobUpdate> = {};
     for (const [id, update] of Object.entries(jobs)) {
       protoJobs[id] = create(HeartbeatJobUpdateSchema, {
@@ -90,7 +95,7 @@ export class ClientRpc {
       });
     }
     const resp = await this.client.heartbeat({ jobs: protoJobs });
-    const out: Record<string, { status: string }> = {};
+    const out: Record<string, import("./index.js").HeartbeatJobStatus> = {};
     for (const [id, jr] of Object.entries(resp.jobs)) {
       out[id] = { status: jr.status };
     }

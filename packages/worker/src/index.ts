@@ -390,7 +390,7 @@ export class CorvoWorker {
 
   private async heartbeat(
     jobs: Record<string, { progress?: Record<string, unknown>; checkpoint?: Record<string, unknown>; usage?: Record<string, unknown> }>
-  ): Promise<{ jobs: Record<string, { status: string }> }> {
+  ): Promise<{ jobs: Record<string, { status: string; budget_exceeded?: boolean }>; lease_expires_at?: string }> {
     return this.request("/api/v1/heartbeat", {
       method: "POST",
       body: JSON.stringify({ jobs }),
