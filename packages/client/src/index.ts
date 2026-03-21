@@ -35,7 +35,7 @@ export type SearchResult<T = Record<string, unknown>> = {
 export type BulkRequest = {
   job_ids?: string[];
   filter?: SearchFilter;
-  action: "retry" | "delete" | "cancel" | "move" | "requeue" | "change_priority" | "hold" | "approve" | "reject";
+  action: "delete" | "cancel" | "move" | "requeue" | "change_priority" | "hold" | "approve" | "reject";
   move_to_queue?: string;
   priority?: string;
   async?: boolean;
@@ -93,12 +93,10 @@ export type FetchedJob = {
   lease_duration?: number;
   checkpoint?: unknown;
   tags?: Record<string, string>;
-  agent?: Record<string, unknown>;
 };
 
 export type HeartbeatJobStatus = {
   status: string;
-  budget_exceeded?: boolean;
 };
 
 export type HeartbeatResult = {
@@ -173,9 +171,11 @@ export type RetryOptions = {
 };
 
 export type ClientOptions = {
-  useRpc?: boolean;
   retry?: RetryOptions;
 };
+
+export { Client } from "./pool.js";
+export { Conn, type ConnFetchedJob } from "./conn.js";
 
 export class PayloadTooLargeError extends Error {
   constructor(message: string) {
@@ -188,37 +188,35 @@ export function isPayloadTooLargeError(err: unknown): err is PayloadTooLargeErro
   return err instanceof PayloadTooLargeError;
 }
 
+export class UniqueConflictError extends Error {
+  readonly uniqueJobId: string;
+  constructor(message: string, uniqueJobId: string) {
+    super(message);
+    this.name = "UniqueConflictError";
+    this.uniqueJobId = uniqueJobId;
+  }
+}
+
+export function isUniqueConflictError(err: unknown): err is UniqueConflictError {
+  return err instanceof UniqueConflictError;
+}
+
 export class CorvoClient {
   readonly baseURL: string;
   readonly fetchImpl: typeof fetch;
   readonly auth: AuthOptions;
-  private readonly useRpc: boolean;
   private readonly retryMaxAttempts: number;
   private readonly retryBaseDelay: number;
-  private rpcClient: import("./rpc.js").ClientRpc | null = null;
 
   constructor(baseURL: string, fetchImpl: typeof fetch = fetch, auth: AuthOptions = {}, opts: ClientOptions = {}) {
     this.baseURL = baseURL.replace(/\/$/, "");
     this.fetchImpl = fetchImpl;
     this.auth = auth;
-    this.useRpc = opts.useRpc ?? false;
     this.retryMaxAttempts = opts.retry?.maxAttempts ?? 3;
     this.retryBaseDelay = opts.retry?.baseDelay ?? 1000;
   }
 
-  private async getRpc(): Promise<import("./rpc.js").ClientRpc> {
-    if (!this.rpcClient) {
-      const { ClientRpc } = await import("./rpc.js");
-      this.rpcClient = new ClientRpc(this.baseURL, this.auth);
-    }
-    return this.rpcClient;
-  }
-
   async enqueue(queue: string, payload: unknown, extra: Record<string, unknown> = {}): Promise<EnqueueResult> {
-    if (this.useRpc && Object.keys(extra).length === 0) {
-      const rpc = await this.getRpc();
-      return rpc.enqueue(queue, payload);
-    }
     const result = await this.request<any>("/api/v1/enqueue", {
       method: "POST",
       body: JSON.stringify({ queue, payload, ...extra }),
@@ -302,10 +300,6 @@ export class CorvoClient {
   }
 
   async fail(jobID: string, error: string, backtrace?: string): Promise<FailResult> {
-    if (this.useRpc) {
-      const rpc = await this.getRpc();
-      return rpc.fail(jobID, error, backtrace ?? "");
-    }
     return this.request(`/api/v1/fail/${encodeURIComponent(jobID)}`, {
       method: "POST",
       body: JSON.stringify({ error, backtrace }),
@@ -313,18 +307,10 @@ export class CorvoClient {
   }
 
   async heartbeat(jobs: Record<string, Record<string, unknown>>): Promise<HeartbeatResult> {
-    if (this.useRpc) {
-      const rpc = await this.getRpc();
-      return rpc.heartbeat(jobs);
-    }
     return this.request("/api/v1/heartbeat", {
       method: "POST",
       body: JSON.stringify({ jobs }),
     });
-  }
-
-  async retryJob(id: string): Promise<void> {
-    await this.request(`/api/v1/jobs/${encodeURIComponent(id)}/retry`, { method: "POST" });
   }
 
   async cancelJob(id: string): Promise<void> {
@@ -468,14 +454,17 @@ export class CorvoClient {
       if (!res.ok) {
         let details = `HTTP ${res.status}`;
         let code = "";
+        let uniqueJobId = "";
         try {
-          const body = (await res.json()) as { error?: string; code?: string };
+          const body = (await res.json()) as { error?: string; code?: string; unique_job_id?: string; unique_existing?: boolean };
           if (body.error) details = body.error;
           if (body.code) code = body.code;
+          if (body.unique_job_id) uniqueJobId = body.unique_job_id;
         } catch {
           // ignore decode errors for non-JSON responses
         }
         if (code === "PAYLOAD_TOO_LARGE") throw new PayloadTooLargeError(details);
+        if (res.status === 409) throw new UniqueConflictError(details, uniqueJobId);
         throw new Error(details);
       }
 
