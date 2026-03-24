@@ -54,7 +54,7 @@ async function testEnqueueOptions() {
   assert(!!result.job_id, "expected non-empty job_id");
 
   const got = await client.getJob<{ priority: number; max_retries: number }>(result.job_id);
-  assert(got.priority === 1, `expected priority=1, got ${got.priority}`);
+  assert(got.priority === 75, `expected priority=75, got ${got.priority}`);
   assert(got.max_retries === 5, `expected max_retries=5, got ${got.max_retries}`);
 
   const job = await client.fetch(["ts-opts-test"], "w1", "host", 3);

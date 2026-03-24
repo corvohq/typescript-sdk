@@ -327,11 +327,6 @@ export class Conn {
   // Timestamp helper
   // -------------------------------------------------------------------------
 
-  private nowNs(): bigint {
-    const ms = Date.now();
-    return BigInt(ms) * 1_000_000n;
-  }
-
   // -------------------------------------------------------------------------
   // Ack encoding helper
   // -------------------------------------------------------------------------
@@ -383,7 +378,7 @@ export class Conn {
 
   async enqueueBatch(jobs: EnqueueJob[]): Promise<number> {
     // Calculate payload size
-    let size = 2 + 8; // count(u16) + now_ns(u64)
+    let size = 2; // count(u16)
     for (const job of jobs) {
       size += 1 + Buffer.byteLength(job.queue, "utf8"); // lenPrefixed queue
       size += 1 + Buffer.byteLength(job.jobId, "utf8"); // lenPrefixed id
@@ -413,7 +408,6 @@ export class Conn {
     let off = 0;
 
     buf.writeUInt16LE(jobs.length, off); off += 2;
-    buf.writeBigUInt64LE(this.nowNs(), off); off += 8;
 
     for (const job of jobs) {
       off = this.writeLenPrefixed(buf, off, job.queue);
@@ -480,7 +474,7 @@ export class Conn {
     leaseMs: number = 30000,
   ): Promise<void> {
     // Calculate payload size
-    let size = 8 + 2 + 4; // now_ns(u64) + count(u16) + lease_ms(u32)
+    let size = 2 + 4; // count(u16) + lease_ms(u32)
     const workerIdBytes = Buffer.from(workerId, "utf8");
     size += 1 + workerIdBytes.length; // lenPrefixed worker_id
     size += 1; // queue_count(u8)
@@ -493,7 +487,6 @@ export class Conn {
     const buf = this.sendBuf;
     let off = 0;
 
-    buf.writeBigUInt64LE(this.nowNs(), off); off += 8;
     buf.writeUInt16LE(credits, off); off += 2;
     buf.writeUInt32LE(leaseMs, off); off += 4;
     off = this.writeLenPrefixed(buf, off, workerId);
@@ -540,14 +533,12 @@ export class Conn {
 
   async ackBatch(acks: AckJob[]): Promise<void> {
     // Calculate payload size
-    let size = 8; // now_ns(u64)
-    size += this.acksSizeEstimate(acks);
+    let size = this.acksSizeEstimate(acks);
 
     this.ensureSendBuf(size);
     const buf = this.sendBuf;
     let off = 0;
 
-    buf.writeBigUInt64LE(this.nowNs(), off); off += 8;
     off = this.encodeAcks(buf, off, acks);
 
     const payload = Buffer.alloc(off);
@@ -564,7 +555,7 @@ export class Conn {
 
   async failBatch(jobs: FailJob[]): Promise<void> {
     // Calculate payload size
-    let size = 8 + 2; // now_ns(u64) + count(u16)
+    let size = 2; // count(u16)
     for (const job of jobs) {
       size += 1 + Buffer.byteLength(job.jobId, "utf8");
       size += 1 + Buffer.byteLength(job.queue, "utf8");
@@ -576,7 +567,6 @@ export class Conn {
     const buf = this.sendBuf;
     let off = 0;
 
-    buf.writeBigUInt64LE(this.nowNs(), off); off += 8;
     buf.writeUInt16LE(jobs.length, off); off += 2;
 
     for (const job of jobs) {
