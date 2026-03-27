@@ -277,7 +277,7 @@ export class CorvoClient {
   }
 
   async enqueueBatch(jobs: BatchJob[], batch?: BatchConfig): Promise<BatchResult> {
-    return this.request("/api/v1/enqueue/batch", {
+    return this.request("/api/v1/enqueue", {
       method: "POST",
       body: JSON.stringify({ jobs, batch }),
     });
