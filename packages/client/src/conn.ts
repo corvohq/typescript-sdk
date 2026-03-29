@@ -13,6 +13,9 @@ const MSG_ACK_BATCH = 0x03;
 const MSG_PING = 0x04;
 const MSG_HEARTBEAT = 0x06;
 const MSG_FAIL_BATCH = 0x07;
+const MSG_CANCEL_SIGNAL = 0x08; // server -> client push
+const MSG_BULK_ACTION = 0x14;
+const MSG_BULK_ACTION_RESP = 0x94;
 const MSG_ERROR = 0xff;
 
 const MSG_FETCH_BATCH_RESP = 0x82;
@@ -91,6 +94,14 @@ export type ConnFetchedJob = {
   tags: string;
   payload: Buffer;
 };
+
+export type Frame =
+  | { type: "fetch_resp"; jobs: ConnFetchedJob[] }
+  | { type: "ack_resp"; affected: number }
+  | { type: "fail_resp"; affected: number }
+  | { type: "cancel_signal"; jobIds: string[] }
+  | { type: "pong" }
+  | { type: "error"; message: string };
 
 type PendingRequest = {
   resolve: (buf: Buffer) => void;
@@ -229,8 +240,8 @@ export class Conn {
         } else {
           req.resolve(payload);
         }
-      } else if (msgType === MSG_FETCH_BATCH_RESP || msgType === MSG_ERROR) {
-        // Pushed frame (from subscription) — deliver to waiter or queue
+      } else {
+        // Pushed frame or fire-and-forget response — deliver to waiter or queue
         const frame = { msgType, payload };
         const waiter = this.pushWaiters.shift();
         if (waiter) {
@@ -529,6 +540,128 @@ export class Conn {
     return new Promise((resolve, reject) => {
       this.pushWaiters.push({ resolve, reject });
     });
+  }
+
+  /**
+   * Read the next frame from the server, dispatched by type.
+   * Use in a message loop after subscribe() to handle interleaved
+   * FETCH_RESP, ACK_RESP, FAIL_RESP, and CANCEL_SIGNAL frames.
+   */
+  async readFrame(): Promise<Frame> {
+    const frame = await this.nextPushedFrame();
+
+    switch (frame.msgType) {
+      case MSG_FETCH_BATCH_RESP:
+        return { type: "fetch_resp", jobs: this.decodeFetchResponse(frame.payload) };
+
+      case MSG_ACK_BATCH | RESPONSE_BIT:
+        return { type: "ack_resp", affected: frame.payload.length >= 2 ? frame.payload.readUInt16LE(0) : 0 };
+
+      case MSG_FAIL_BATCH | RESPONSE_BIT:
+        return { type: "fail_resp", affected: frame.payload.length >= 2 ? frame.payload.readUInt16LE(0) : 0 };
+
+      case MSG_CANCEL_SIGNAL: {
+        const jobIds: string[] = [];
+        if (frame.payload.length >= 2) {
+          const count = frame.payload.readUInt16LE(0);
+          let off = 2;
+          for (let i = 0; i < count && off < frame.payload.length; i++) {
+            let id: string;
+            [id, off] = this.readLenPrefixed(frame.payload, off);
+            jobIds.push(id);
+          }
+        }
+        return { type: "cancel_signal", jobIds };
+      }
+
+      case MSG_PING | RESPONSE_BIT:
+        return { type: "pong" };
+
+      case MSG_ERROR: {
+        const message = frame.payload.length > 0 ? frame.payload.toString("utf8") : "server error";
+        return { type: "error", message };
+      }
+
+      default:
+        throw new Error(`unexpected message type: 0x${frame.msgType.toString(16)}`);
+    }
+  }
+
+  /**
+   * Send ack batch without waiting for response (fire-and-forget).
+   * Response arrives via readFrame() as { type: "ack_resp" }.
+   */
+  async sendAck(acks: AckJob[]): Promise<void> {
+    let size = this.acksSizeEstimate(acks);
+    this.ensureSendBuf(size);
+    const buf = this.sendBuf;
+    let off = 0;
+    off = this.encodeAcks(buf, off, acks);
+
+    const payload = Buffer.alloc(off);
+    buf.copy(payload, 0, 0, off);
+    await this.sendFrameFireAndForget(MSG_ACK_BATCH, payload);
+  }
+
+  /**
+   * Send fail batch without waiting for response (fire-and-forget).
+   * Response arrives via readFrame() as { type: "fail_resp" }.
+   */
+  async sendFail(jobs: FailJob[]): Promise<void> {
+    let size = 2;
+    for (const job of jobs) {
+      size += 1 + Buffer.byteLength(job.jobId, "utf8");
+      size += 1 + Buffer.byteLength(job.queue, "utf8");
+      size += 1 + Buffer.byteLength(job.error, "utf8");
+      size += 1 + Buffer.byteLength(job.backtrace ?? "", "utf8");
+    }
+
+    this.ensureSendBuf(size);
+    const buf = this.sendBuf;
+    let off = 0;
+
+    buf.writeUInt16LE(jobs.length, off); off += 2;
+    for (const job of jobs) {
+      off = this.writeLenPrefixed(buf, off, job.jobId);
+      off = this.writeLenPrefixed(buf, off, job.queue);
+      off = this.writeLenPrefixed(buf, off, job.error);
+      off = this.writeLenPrefixed(buf, off, job.backtrace ?? "");
+    }
+
+    const payload = Buffer.alloc(off);
+    buf.copy(payload, 0, 0, off);
+    await this.sendFrameFireAndForget(MSG_FAIL_BATCH, payload);
+  }
+
+  /**
+   * Cancel jobs by ID. Sends MSG_BULK_ACTION with cancel action.
+   * Returns the number of jobs cancelled.
+   */
+  async cancel(jobIds: string[]): Promise<number> {
+    // Wire: [action:u8][queue:lenPrefixed][count:u16][{id:lenPrefixed}...][flags:u8][now_ns:u64]
+    let size = 1 + 1 + 2 + 1 + 8; // action + empty queue + count + flags + now_ns
+    for (const id of jobIds) {
+      size += 1 + Buffer.byteLength(id, "utf8");
+    }
+
+    this.ensureSendBuf(size);
+    const buf = this.sendBuf;
+    let off = 0;
+
+    buf[off] = 3; off += 1; // BulkAction.cancel = 3
+    off = this.writeLenPrefixed(buf, off, ""); // queue (empty)
+    buf.writeUInt16LE(jobIds.length, off); off += 2;
+    for (const id of jobIds) {
+      off = this.writeLenPrefixed(buf, off, id);
+    }
+    buf[off] = 0; off += 1; // flags
+    buf.writeBigUInt64LE(0n, off); off += 8; // now_ns
+
+    const payload = Buffer.alloc(off);
+    buf.copy(payload, 0, 0, off);
+
+    const resp = await this.sendFrame(MSG_BULK_ACTION, payload);
+    return resp.length >= 2 ? resp.readUInt16LE(0) : 0;
   }
 
   async ackBatch(acks: AckJob[]): Promise<void> {

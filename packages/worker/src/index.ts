@@ -32,6 +32,10 @@ export type WorkerConfig = {
 };
 
 export type WorkerJobContext = {
+  /** AbortSignal that fires when the job is cancelled by the server.
+   * Pass to fetch(), timers, or any API that accepts AbortSignal
+   * to stop work immediately when the job is cancelled. */
+  signal: AbortSignal;
   isCancelled: () => boolean;
   checkpoint: (checkpoint: Record<string, unknown>) => Promise<void>;
   progress: (current: number, total: number, message: string) => Promise<void>;
@@ -41,7 +45,7 @@ export class CorvoWorker {
   private readonly client: CorvoClient;
   private readonly cfg: Required<WorkerConfig>;
   private readonly handlers: Map<string, WorkerHandler> = new Map();
-  private readonly active: Map<string, { cancelled: boolean }> = new Map();
+  private readonly active: Map<string, { cancelled: boolean; abort: AbortController }> = new Map();
   private stopping = false;
   private readonly fetchBatchSize: number;
   private readonly ackBatchSize: number;
@@ -123,8 +127,10 @@ export class CorvoWorker {
             continue;
           }
 
-          this.active.set(job.job_id, { cancelled: false });
+          const ac = new AbortController();
+          this.active.set(job.job_id, { cancelled: false, abort: ac });
           const ctx: WorkerJobContext = {
+            signal: ac.signal,
             isCancelled: () => this.active.get(job.job_id)?.cancelled === true,
             checkpoint: async (checkpoint) => {
               await this.heartbeat({ [job.job_id]: { checkpoint } });
@@ -188,7 +194,10 @@ export class CorvoWorker {
         for (const [jobID, info] of Object.entries(result.jobs || {})) {
           if (info.status === "cancel") {
             const state = this.active.get(jobID);
-            if (state) state.cancelled = true;
+            if (state) {
+              state.cancelled = true;
+              state.abort.abort();
+            }
           }
         }
       } catch {
