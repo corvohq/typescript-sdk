@@ -93,6 +93,7 @@ export type FetchedJob = {
   lease_duration?: number;
   checkpoint?: unknown;
   tags?: Record<string, string>;
+  lease_token?: bigint;
 };
 
 export type HeartbeatJobStatus = {

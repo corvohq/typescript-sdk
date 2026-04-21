@@ -69,6 +69,7 @@ export type AckJob = {
   result?: string;      // optional
   checkpoint?: string;  // optional
   holdReason?: string;  // optional
+  leaseToken?: bigint;  // optional
 };
 
 export type FailJob = {
@@ -76,6 +77,7 @@ export type FailJob = {
   queue: string;
   error: string;
   backtrace?: string;   // default ""
+  leaseToken?: bigint;  // optional
 };
 
 export type HeartbeatJob = {
@@ -93,6 +95,7 @@ export type ConnFetchedJob = {
   checkpoint: string;
   tags: string;
   payload: Buffer;
+  leaseToken: bigint;
 };
 
 export type Frame =
@@ -356,11 +359,13 @@ export class Conn {
       if (ack.result !== undefined && ack.result !== "") flags |= 0x01;
       if (ack.checkpoint !== undefined && ack.checkpoint !== "") flags |= 0x02;
       if (ack.holdReason !== undefined && ack.holdReason !== "") flags |= 0x04;
+      if (ack.leaseToken !== undefined) flags |= 0x08;
       buf[off] = flags; off += 1;
 
       if (flags & 0x01) off = this.writeLenPrefixed(buf, off, ack.result!);
       if (flags & 0x02) off = this.writeLenPrefixed(buf, off, ack.checkpoint!);
       if (flags & 0x04) off = this.writeLenPrefixed(buf, off, ack.holdReason!);
+      if (flags & 0x08) { buf.writeBigUInt64LE(ack.leaseToken!, off); off += 8; }
     }
 
     return off;
@@ -379,6 +384,8 @@ export class Conn {
         size += 1 + Buffer.byteLength(ack.checkpoint, "utf8");
       if (ack.holdReason !== undefined && ack.holdReason !== "")
         size += 1 + Buffer.byteLength(ack.holdReason, "utf8");
+      if (ack.leaseToken !== undefined)
+        size += 8;
     }
     return size;
   }
@@ -614,6 +621,8 @@ export class Conn {
       size += 1 + Buffer.byteLength(job.queue, "utf8");
       size += 1 + Buffer.byteLength(job.error, "utf8");
       size += 1 + Buffer.byteLength(job.backtrace ?? "", "utf8");
+      size += 1; // flags byte
+      if (job.leaseToken !== undefined) size += 8;
     }
 
     this.ensureSendBuf(size);
@@ -626,6 +635,10 @@ export class Conn {
       off = this.writeLenPrefixed(buf, off, job.queue);
       off = this.writeLenPrefixed(buf, off, job.error);
       off = this.writeLenPrefixed(buf, off, job.backtrace ?? "");
+      let flags = 0;
+      if (job.leaseToken !== undefined) flags |= 0x01;
+      buf[off] = flags; off += 1;
+      if (flags & 0x01) { buf.writeBigUInt64LE(job.leaseToken!, off); off += 8; }
     }
 
     const payload = Buffer.alloc(off);
@@ -694,6 +707,8 @@ export class Conn {
       size += 1 + Buffer.byteLength(job.queue, "utf8");
       size += 1 + Buffer.byteLength(job.error, "utf8");
       size += 1 + Buffer.byteLength(job.backtrace ?? "", "utf8");
+      size += 1; // flags byte
+      if (job.leaseToken !== undefined) size += 8;
     }
 
     this.ensureSendBuf(size);
@@ -707,6 +722,10 @@ export class Conn {
       off = this.writeLenPrefixed(buf, off, job.queue);
       off = this.writeLenPrefixed(buf, off, job.error);
       off = this.writeLenPrefixed(buf, off, job.backtrace ?? "");
+      let flags = 0;
+      if (job.leaseToken !== undefined) flags |= 0x01;
+      buf[off] = flags; off += 1;
+      if (flags & 0x01) { buf.writeBigUInt64LE(job.leaseToken!, off); off += 8; }
     }
 
     const payload = Buffer.alloc(off);
@@ -802,7 +821,9 @@ export class Conn {
       resp.copy(payload, 0, off, off + payloadLen);
       off += payloadLen;
 
-      jobs.push({ id, queue, attempt, maxRetries, checkpoint, tags, payload });
+      const leaseToken = resp.readBigUInt64LE(off); off += 8;
+
+      jobs.push({ id, queue, attempt, maxRetries, checkpoint, tags, payload, leaseToken });
     }
 
     return jobs;
