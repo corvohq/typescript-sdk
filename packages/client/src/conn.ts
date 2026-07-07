@@ -11,6 +11,7 @@ const MSG_ENQUEUE_BATCH = 0x01;
 const MSG_FETCH_BATCH = 0x02;
 const MSG_ACK_BATCH = 0x03;
 const MSG_PING = 0x04;
+const MSG_AUTH = 0x05; // connection auth handshake (client -> server)
 const MSG_HEARTBEAT = 0x06;
 const MSG_FAIL_BATCH = 0x07;
 const MSG_CANCEL_SIGNAL = 0x08; // server -> client push
@@ -19,6 +20,7 @@ const MSG_BULK_ACTION_RESP = 0x94;
 const MSG_ERROR = 0xff;
 
 const MSG_FETCH_BATCH_RESP = 0x82;
+const MSG_AUTH_RESP = 0x85; // auth handshake result (server -> client)
 
 // ---------------------------------------------------------------------------
 // Backoff constants
@@ -120,6 +122,7 @@ export class Conn {
   private socket: net.Socket | null = null;
   private host: string;
   private port: number;
+  private authToken: string;
   private reqId: number = 0;
   private sendBuf: Buffer;
   private recvBuf: Buffer;
@@ -129,9 +132,18 @@ export class Conn {
   private pushedFrames: { msgType: number; payload: Buffer }[] = [];
   private pushWaiters: { resolve: (frame: { msgType: number; payload: Buffer }) => void; reject: (err: Error) => void }[] = [];
 
-  constructor(host: string, port: number) {
+  /**
+   * @param host   server host
+   * @param port   server RPC port
+   * @param authToken  optional API key or admin password. When set, the
+   *   connection performs the MSG_AUTH handshake immediately after each
+   *   (re)connect, before any other frame. Required when the server is started
+   *   with an admin password; leave empty otherwise (backward compatible).
+   */
+  constructor(host: string, port: number, authToken: string = "") {
     this.host = host;
     this.port = port;
+    this.authToken = authToken;
     this.sendBuf = Buffer.alloc(64 * 1024);
     this.recvBuf = Buffer.alloc(64 * 1024);
   }
@@ -154,8 +166,26 @@ export class Conn {
 
       sock.on("connect", () => {
         this.socket = sock;
-        this.connectPromise = null;
-        resolve();
+        if (this.authToken) {
+          // Authenticate before any other frame. Servers started with an admin
+          // password gate the connection until the MSG_AUTH handshake succeeds.
+          // Runs on every (re)connect since a fresh socket re-enters this path.
+          this.authenticate().then(
+            () => {
+              this.connectPromise = null;
+              resolve();
+            },
+            (err) => {
+              this.connectPromise = null;
+              this.socket = null;
+              sock.destroy();
+              reject(err instanceof Error ? err : new Error(String(err)));
+            },
+          );
+        } else {
+          this.connectPromise = null;
+          resolve();
+        }
       });
 
       sock.on("error", (err) => {
@@ -177,6 +207,34 @@ export class Conn {
     });
 
     return this.connectPromise;
+  }
+
+  /**
+   * Perform the MSG_AUTH handshake on the freshly-opened socket.
+   * Wire: send MSG_AUTH with payload [token_len:u8][token bytes]; read
+   * MSG_AUTH_RESP with payload [status:u8 (0=ok)][role:u8]. Rejects (and the
+   * caller closes the socket) on a non-ok status or an unexpected message type.
+   */
+  private async authenticate(): Promise<void> {
+    const tokenBytes = Buffer.from(this.authToken, "utf8");
+    const tokenLen = Math.min(tokenBytes.length, 255);
+    const payload = Buffer.alloc(1 + tokenLen);
+    payload[0] = tokenLen;
+    tokenBytes.copy(payload, 1, 0, tokenLen);
+
+    // Send the auth frame; its response is not registered in the pending map,
+    // so it is delivered as a pushed frame — which preserves the msg type we
+    // must validate. processFrames() reads exactly the 9-byte header then the
+    // full payload before delivering, so we never read a partial response.
+    await this.sendFrameFireAndForget(MSG_AUTH, payload);
+
+    const frame = await this.nextPushedFrame();
+    if (frame.msgType !== MSG_AUTH_RESP) {
+      throw new Error(`unexpected auth response type: 0x${frame.msgType.toString(16)}`);
+    }
+    if (frame.payload.length < 1 || frame.payload[0] !== 0) {
+      throw new Error("authentication failed");
+    }
   }
 
   close(): void {
