@@ -15,12 +15,17 @@ const MSG_AUTH = 0x05; // connection auth handshake (client -> server)
 const MSG_HEARTBEAT = 0x06;
 const MSG_FAIL_BATCH = 0x07;
 const MSG_CANCEL_SIGNAL = 0x08; // server -> client push
+const MSG_NOT_LEADER = 0x09; // server -> client push: leader stepped down
 const MSG_BULK_ACTION = 0x14;
 const MSG_BULK_ACTION_RESP = 0x94;
 const MSG_ERROR = 0xff;
 
 const MSG_FETCH_BATCH_RESP = 0x82;
 const MSG_AUTH_RESP = 0x85; // auth handshake result (server -> client)
+
+// Delay before re-subscribing after a transient server rejection — the
+// subscription table being at capacity, or a cluster leader stepping down.
+const SUBSCRIBE_RETRY_DELAY_MS = 1000;
 
 // ---------------------------------------------------------------------------
 // Backoff constants
@@ -131,6 +136,7 @@ export class Conn {
   private connectPromise: Promise<void> | null = null;
   private pushedFrames: { msgType: number; payload: Buffer }[] = [];
   private pushWaiters: { resolve: (frame: { msgType: number; payload: Buffer }) => void; reject: (err: Error) => void }[] = [];
+  private subscription: { queues: string[]; workerId: string; credits: number; leaseMs: number } | null = null;
 
   /**
    * @param host   server host
@@ -574,27 +580,50 @@ export class Conn {
     const payload = Buffer.alloc(off);
     buf.copy(payload, 0, 0, off);
 
+    // Remember the last subscription so readPushedJobs() can re-subscribe
+    // after a transient server rejection without the caller re-issuing it.
+    this.subscription = { queues, workerId, credits, leaseMs };
+
     await this.sendFrameFireAndForget(MSG_FETCH_BATCH, payload);
+  }
+
+  /**
+   * Re-send the last subscription after a transient rejection (server at
+   * capacity, or a leader step-down). Backs off briefly first so the worker
+   * keeps draining without a tight reconnect loop.
+   */
+  private async resubscribe(): Promise<void> {
+    await new Promise((r) => setTimeout(r, SUBSCRIBE_RETRY_DELAY_MS));
+    const s = this.subscription!;
+    await this.subscribe(s.queues, s.workerId, s.credits, s.leaseMs);
   }
 
   /**
    * Read the next pushed batch of jobs from the server.
    * Blocks until a MSG_FETCH_BATCH_RESP frame arrives.
-   * Throws on MSG_ERROR or unexpected message types.
+   *
+   * A subscribe request may be answered with MSG_ERROR when the server's
+   * subscription table is at capacity, and a cluster leader step-down may push
+   * MSG_NOT_LEADER to an already-subscribed connection. Both are transient:
+   * back off briefly and re-subscribe rather than failing the worker. (Leader
+   * redirect is intentionally not handled here.) Throws only on a genuinely
+   * unexpected message type.
    */
   async readPushedJobs(): Promise<ConnFetchedJob[]> {
-    const frame = await this.nextPushedFrame();
+    for (;;) {
+      const frame = await this.nextPushedFrame();
 
-    if (frame.msgType === MSG_ERROR) {
-      const errMsg = frame.payload.length > 0 ? frame.payload.toString("utf8") : "server error";
-      throw new Error(errMsg);
-    }
+      if (frame.msgType === MSG_FETCH_BATCH_RESP) {
+        return this.decodeFetchResponse(frame.payload);
+      }
 
-    if (frame.msgType !== MSG_FETCH_BATCH_RESP) {
+      if (frame.msgType === MSG_ERROR || frame.msgType === MSG_NOT_LEADER) {
+        await this.resubscribe();
+        continue;
+      }
+
       throw new Error(`unexpected pushed message type: 0x${frame.msgType.toString(16)}`);
     }
-
-    return this.decodeFetchResponse(frame.payload);
   }
 
   private nextPushedFrame(): Promise<{ msgType: number; payload: Buffer }> {
@@ -646,6 +675,12 @@ export class Conn {
         const message = frame.payload.length > 0 ? frame.payload.toString("utf8") : "server error";
         return { type: "error", message };
       }
+
+      case MSG_NOT_LEADER:
+        // Leader stepped down on an already-subscribed connection. Surface as a
+        // retryable error frame (the payload's leader hint is intentionally not
+        // acted on) so the read loop reconnects instead of crashing.
+        return { type: "error", message: "not leader" };
 
       default:
         throw new Error(`unexpected message type: 0x${frame.msgType.toString(16)}`);
@@ -874,7 +909,10 @@ export class Conn {
       let tags: string;
       [tags, off] = this.readLenPrefixed(resp, off);
 
-      const payloadLen = resp.readUInt16LE(off); off += 2;
+      // payload_len is a u32: the server's default max_payload_size is 65536
+      // and its ceiling (rpc.MAX_PAYLOAD_SIZE) is 256 KiB, both of which exceed
+      // u16's 65535 cap, so this field must be read as 4 bytes.
+      const payloadLen = resp.readUInt32LE(off); off += 4;
       const payload = Buffer.alloc(payloadLen);
       resp.copy(payload, 0, off, off + payloadLen);
       off += payloadLen;

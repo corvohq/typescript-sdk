@@ -17,7 +17,9 @@ const RESPONSE_BIT = 0x80;
 const MSG_FETCH_BATCH = 0x02;
 const MSG_ACK_BATCH = 0x03;
 const MSG_FAIL_BATCH = 0x07;
+const MSG_NOT_LEADER = 0x09;
 const MSG_FETCH_BATCH_RESP = 0x82;
+const MSG_ERROR = 0xff;
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -152,9 +154,9 @@ async function testFetchResponseWithLeaseToken() {
       off = putLenPrefixed(resp, off, "");
       // tags (empty len-prefixed)
       off = putLenPrefixed(resp, off, "");
-      // payload: u16 len + data
+      // payload: u32 len + data
       const payloadBytes = Buffer.from('{"hello":"world"}', "utf8");
-      resp.writeUInt16LE(payloadBytes.length, off); off += 2;
+      resp.writeUInt32LE(payloadBytes.length, off); off += 4;
       payloadBytes.copy(resp, off); off += payloadBytes.length;
       // lease_token(u64 LE)
       resp.writeBigUInt64LE(leaseTokenValue, off); off += 8;
@@ -211,7 +213,7 @@ async function testFetchResponseMultipleJobs() {
       off = putLenPrefixed(resp, off, '{"step":1}'); // checkpoint
       off = putLenPrefixed(resp, off, ''); // tags
       const p1 = Buffer.from('{"a":1}', "utf8");
-      resp.writeUInt16LE(p1.length, off); off += 2;
+      resp.writeUInt32LE(p1.length, off); off += 4;
       p1.copy(resp, off); off += p1.length;
       resp.writeBigUInt64LE(111n, off); off += 8; // lease_token
 
@@ -222,7 +224,7 @@ async function testFetchResponseMultipleJobs() {
       resp.writeUInt16LE(10, off); off += 2; // max_retries
       off = putLenPrefixed(resp, off, ""); // checkpoint
       off = putLenPrefixed(resp, off, ""); // tags
-      resp.writeUInt16LE(0, off); off += 2; // no payload
+      resp.writeUInt32LE(0, off); off += 4; // no payload
       resp.writeBigUInt64LE(222n, off); off += 8; // lease_token
 
       writeFrame(sock, MSG_FETCH_BATCH_RESP, reqId, resp.subarray(0, off));
@@ -242,6 +244,139 @@ async function testFetchResponseMultipleJobs() {
       assert(jobs[1].leaseToken === 222n, `job[1].leaseToken = ${jobs[1].leaseToken}, want 222n`);
       assert(jobs[1].attempt === 4, `job[1].attempt = ${jobs[1].attempt}, want 4`);
       assert(jobs[1].maxRetries === 10, `job[1].maxRetries = ${jobs[1].maxRetries}, want 10`);
+    } finally {
+      conn.close();
+    }
+  } finally {
+    cleanup();
+  }
+}
+
+async function testFetchResponseLargePayload() {
+  console.log("--- test: fetch response with a 65536-byte payload (u32 length) ---");
+
+  // 65536 is impossible under the old u16 payload-length format (max 65535)
+  // and is exactly the server's default max_payload_size.
+  const PAYLOAD_LEN = 65536;
+
+  const { host, port, cleanup } = await mockServer((sock) => {
+    readFrame(sock).then(({ reqId }) => {
+      const payloadBytes = Buffer.alloc(PAYLOAD_LEN);
+      for (let i = 0; i < PAYLOAD_LEN; i++) payloadBytes[i] = i & 0xff;
+
+      const resp = Buffer.alloc(PAYLOAD_LEN + 256);
+      let off = 0;
+
+      // count = 1
+      resp.writeUInt16LE(1, off); off += 2;
+      off = putLenPrefixed(resp, off, "big-job");
+      off = putLenPrefixed(resp, off, "bulk");
+      resp.writeUInt16LE(1, off); off += 2; // attempt
+      resp.writeUInt16LE(3, off); off += 2; // max_retries
+      off = putLenPrefixed(resp, off, ""); // checkpoint
+      off = putLenPrefixed(resp, off, ""); // tags
+      // payload: u32 len + data
+      resp.writeUInt32LE(payloadBytes.length, off); off += 4;
+      payloadBytes.copy(resp, off); off += payloadBytes.length;
+      resp.writeBigUInt64LE(0x1234n, off); off += 8; // lease_token
+
+      writeFrame(sock, MSG_FETCH_BATCH_RESP, reqId, resp.subarray(0, off));
+    });
+  });
+
+  try {
+    const conn = new Conn(host, port);
+    try {
+      await conn.subscribe(["bulk"], "w1", 1, 30000);
+      const jobs = await conn.readPushedJobs();
+
+      assert(jobs.length === 1, `expected 1 job, got ${jobs.length}`);
+      assert(jobs[0].id === "big-job", `expected id=big-job, got ${jobs[0].id}`);
+      assert(
+        jobs[0].payload.length === PAYLOAD_LEN,
+        `expected payload length=${PAYLOAD_LEN}, got ${jobs[0].payload.length}`,
+      );
+      assert(jobs[0].payload[0] === 0, `expected payload[0]=0, got ${jobs[0].payload[0]}`);
+      assert(
+        jobs[0].payload[PAYLOAD_LEN - 1] === ((PAYLOAD_LEN - 1) & 0xff),
+        `expected payload[last]=${(PAYLOAD_LEN - 1) & 0xff}, got ${jobs[0].payload[PAYLOAD_LEN - 1]}`,
+      );
+      assert(jobs[0].leaseToken === 0x1234n, `expected leaseToken=0x1234, got 0x${jobs[0].leaseToken.toString(16)}`);
+    } finally {
+      conn.close();
+    }
+  } finally {
+    cleanup();
+  }
+}
+
+async function testSubscribeRejectedRetries() {
+  console.log("--- test: subscribe rejected (MSG_ERROR) backs off and re-subscribes ---");
+
+  let subscribeCount = 0;
+
+  const { host, port, cleanup } = await mockServer((sock) => {
+    // First subscribe: reject with MSG_ERROR (server at capacity). The SDK must
+    // back off and re-subscribe rather than throwing. Second subscribe: push a
+    // job, proving the connection recovered.
+    const onSubscribe = ({ reqId }: { reqId: number }) => {
+      subscribeCount++;
+      if (subscribeCount === 1) {
+        const msg = Buffer.from("subscription rejected: server at connection capacity", "utf8");
+        writeFrame(sock, MSG_ERROR, reqId, msg);
+        readFrame(sock).then(onSubscribe);
+        return;
+      }
+
+      const resp = Buffer.alloc(256);
+      let off = 0;
+      resp.writeUInt16LE(1, off); off += 2;
+      off = putLenPrefixed(resp, off, "job-after-retry");
+      off = putLenPrefixed(resp, off, "emails");
+      resp.writeUInt16LE(1, off); off += 2; // attempt
+      resp.writeUInt16LE(3, off); off += 2; // max_retries
+      off = putLenPrefixed(resp, off, ""); // checkpoint
+      off = putLenPrefixed(resp, off, ""); // tags
+      resp.writeUInt32LE(0, off); off += 4; // no payload
+      resp.writeBigUInt64LE(7n, off); off += 8; // lease_token
+      writeFrame(sock, MSG_FETCH_BATCH_RESP, reqId, resp.subarray(0, off));
+    };
+    readFrame(sock).then(onSubscribe);
+  });
+
+  try {
+    const conn = new Conn(host, port);
+    try {
+      await conn.subscribe(["emails"], "w1", 5, 30000);
+      const jobs = await conn.readPushedJobs();
+
+      assert(subscribeCount === 2, `expected 2 subscribe attempts, got ${subscribeCount}`);
+      assert(jobs.length === 1, `expected 1 job, got ${jobs.length}`);
+      assert(jobs[0].id === "job-after-retry", `expected id=job-after-retry, got ${jobs[0].id}`);
+    } finally {
+      conn.close();
+    }
+  } finally {
+    cleanup();
+  }
+}
+
+async function testNotLeaderFrameIsRetryable() {
+  console.log("--- test: MSG_NOT_LEADER via readFrame surfaces as a retryable error, no crash ---");
+
+  const { host, port, cleanup } = await mockServer((sock) => {
+    readFrame(sock).then(({ reqId }) => {
+      // Push MSG_NOT_LEADER (leader stepped down) to the subscribed connection.
+      writeFrame(sock, MSG_NOT_LEADER, reqId, Buffer.from([0x01, 0x02]));
+    });
+  });
+
+  try {
+    const conn = new Conn(host, port);
+    try {
+      await conn.subscribe(["emails"], "w1", 5, 30000);
+      const frame = await conn.readFrame();
+      assert(frame.type === "error", `expected error frame, got ${frame.type}`);
     } finally {
       conn.close();
     }
@@ -666,6 +801,9 @@ async function main() {
   const tests = [
     ["fetch response with lease_token", testFetchResponseWithLeaseToken],
     ["fetch response multiple jobs", testFetchResponseMultipleJobs],
+    ["fetch response large (65536-byte) payload", testFetchResponseLargePayload],
+    ["subscribe rejected retries", testSubscribeRejectedRetries],
+    ["not-leader frame is retryable", testNotLeaderFrameIsRetryable],
     ["ack encoding with lease_token", testAckEncodingWithLeaseToken],
     ["ack encoding with optional fields and lease_token", testAckEncodingWithOptionalFieldsAndLeaseToken],
     ["ack encoding without lease_token", testAckEncodingWithoutLeaseToken],
